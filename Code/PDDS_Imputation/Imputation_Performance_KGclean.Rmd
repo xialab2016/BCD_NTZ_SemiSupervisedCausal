@@ -1,0 +1,613 @@
+---
+title: "PDDS Imputation Performance"
+author: "Dominic DiSanto"
+date: "Updated Dec 21, 2023"
+output: html_document
+---
+
+```{r, echo=F}
+# Set-Up #### 
+  if("pacman" %in% installed.packages()[,1]){
+    library(pacman)
+  }else{
+    install.packages("pacman")
+    library(pacman)
+  }
+  
+  p_load(here, caret
+         , corrplot 
+         , rms, ordinal, ordinalNet # linear methods
+         , psych # wkappa 
+         , DescTools # SomersDelta
+         , readr
+         , dplyr
+         , tidyr
+         , stringr
+         , tibble
+         , DT
+  )
+  
+  select <- dplyr::select # Resolve conflict with MASS ridge function 
+  summarize <- dplyr::summarize # Resolve conflict with Hmisc  
+  union = dplyr::union # silent conflict with lubridate 
+  
+  knitr::opts_chunk$set(echo=F)
+  
+```
+
+
+```{r}
+# Import and store as lists 
+
+filenames = list.files(path = here("Results", "Models", "Final"), pattern="\\.RDS")
+model.rds = grep("tune", filenames, value=T)
+df.rds = grep("analytic_output", filenames, value=T)
+
+models = lapply(here("Results", "Models", "Final", model.rds), readRDS)
+analytic_dfs = lapply(here("Results", "Models", "Final", df.rds), readRDS)
+
+```
+
+```{r}
+.tmp_perf <- function(preds
+                      , lp
+                      , E
+                      , analytic_output = analytic_output_KG
+                      , test_indx){
+  
+  .preds = factor(preds-1, levels = 0:7)
+  
+  return(
+    # list(Model = model
+         # , Pred = .preds, 
+         Perf = c(Accuracy = sum(.preds==analytic_output$Y[test_indx]) / length(analytic_output$Y[test_indx])
+                  , ConcordanceClass = survival::concordance(analytic_output$Y[test_indx] ~ preds)$concordance
+                  , ConcordanceLinearPredictor = survival::concordance(analytic_output$Y[test_indx] ~ lp)$concordance
+                  , ConcordanceExpectation = survival::concordance(analytic_output$Y[test_indx] ~ E)$concordance
+                    , WKappa = psych::wkappa(table(.preds, analytic_output$Y[test_indx]))$weighted.kappa
+                    , SomersD = DescTools::SomersDelta(.preds, analytic_output$Y[test_indx], "column")
+                    , KendallsTau = cor(as.numeric(.preds), analytic_output$Y[test_indx], method="kendall") 
+         )
+    # )
+  )
+}
+
+impute.preds = function(model
+                        , .data 
+                        , return.preds = F
+                          ){
+
+  set.seed(826178) #hard-coded seed to assure same text-index as in training 
+
+  cv_ids = sample(unique(.data$analytic_df$PATIENT_NUM)
+                  , size = 0.8*length(unique(.data$analytic_df$PATIENT_NUM))
+                  , replace = F)
+  
+  cv_indx = .data$analytic_df$PATIENT_NUM %in% cv_ids
+  test_indx = .data$analytic_df$PATIENT_NUM %nin% cv_ids
+  
+
+  .tmp_X = .data$X[test_indx,] %>% 
+    select(-c(Disease_Subtype_1, Disease_Subtype_2)) %>% 
+    mutate_if(is.factor, is.numeric) %>% 
+    as.matrix()
+  
+  preds = predict(model$fit
+                   , newx = .tmp_X
+                   , type = "class"
+                   , whichLambda = which.min(apply(model$misclass, 1, mean))
+                   )
+
+  lp =drop(-predict(model$fit
+                   , newx = .tmp_X
+                   , type = "link"
+                   , whichLambda = which.min(apply(model$misclass, 1, mean))
+                   )[,5])
+  
+  expectation = drop(predict(model$fit
+                   , newx = .tmp_X
+                   , type = "response"
+                   , whichLambda = which.min(apply(model$misclass, 1, mean))
+                   ) %*% 0:7)
+  
+  perf = .tmp_perf(preds = preds
+                   , lp = lp 
+                   , E = expectation 
+                   , analytic_output = .data
+                   , test_indx = test_indx)
+  
+  # covar_sum = reg_covar_sum(model)
+
+  if(return.preds){
+    return(preds)
+  }
+  
+  return(perf#list(perf=perf
+              # , covar_sum = covar_sum
+              # , preds=preds
+          #    )
+         )
+}
+
+
+
+
+reg_covar_sum = function(object){
+  
+  .L = which.min(apply(object$misclass, 1, mean))
+  
+  .L_coefs =  object$fit$coefs[.L, grep("Intercept", colnames(object$fit$coefs), invert = T)]
+  nlp_nms = substr(names(.L_coefs), 1, 1)=="C" & substr(names(.L_coefs), 1, 3)!="CCS"
+  nz_b = abs(.L_coefs)>0; names(nz_b) = NULL
+  
+  # if(lasso){
+    .op = c(`N EHR Fts` = sum(!nlp_nms)-1
+             , `N Non-zero EHR Fts` = sum((!nlp_nms)*nz_b)-1
+             , `N NLP Fts` = sum(nlp_nms)
+             , `N Non-zero NLP Fts` = sum(nlp_nms*nz_b)
+             )
+  return(.op)
+}
+
+
+object = models[[1]]
+data = analytic_dfs[[1]]
+.pred_corplot <- function(object
+                          , data 
+                          , .title = ""
+                          , .plot = "ggplot"){
+
+  .preds = impute.preds(model = object, .data = data, return.preds = T)-1
+  
+  set.seed(826178) #hard-coded seed to assure same text-index as in training 
+
+  cv_ids = sample(unique(data$analytic_df$PATIENT_NUM)
+                  , size = 0.8*length(unique(data$analytic_df$PATIENT_NUM))
+                  , replace = F)
+  
+  cv_indx = data$analytic_df$PATIENT_NUM %in% cv_ids
+  test_indx = data$analytic_df$PATIENT_NUM %nin% cv_ids
+
+  factor.preds = factor(.preds, levels=0:7)
+  levels(factor.preds)[8] = "7/8"
+  factor.obs = factor(data$Y[test_indx])
+  levels(factor.obs)[8] = "7/8"
+  # table(factor.preds, factor.obs)
+  
+  # table(.preds-1, analytic_output_KG$Y[test_indx]) %>%
+  # table(.preds, data$Y[test_indx]) %>%
+  if(.plot!="ggplot"){
+  table(factor.preds, factor.obs) %>% 
+    as.matrix() %>% 
+    apply(MARGIN = 2, function(x) x / sum(x)) %>% 
+    corrplot::corrplot(is.corr = F
+                       , mar = c(1, 5, 3, 1)
+                       , title = .title
+                       , col.lim = c(0, 1)
+                       , col = COL1("Greens", 100)
+                       , addCoef.col = 'black'
+                       , method = 'square'
+                       , tl.col = 'black'
+    )
+  mtext("Predicted\nValues", side=2, line=-0.5, at=5, las=1)
+  mtext("Observed Values", side=1, line=-27, at=5, las=1)
+  }
+  
+  table(factor.preds, factor.obs) %>% 
+  as.matrix() %>% 
+  apply(MARGIN = 2, function(x) x / sum(x)) %>%
+  as.data.frame() %>% 
+  rownames_to_column("Predicted") %>% 
+  pivot_longer(cols = `0`:`7/8`, names_to = "Observed", values_to = "Proportion") %>% 
+  mutate(PropLab = ifelse(Proportion>=0.05, round(Proportion, 2), "")
+         , Predicted = factor(Predicted, levels=c("7/8", 6:0))
+         ) %>% 
+  ggplot(aes(x=Observed, y=Predicted, size=Proportion, color=Proportion, label=PropLab)) + 
+  geom_point(shape=15) +
+  geom_text(color="black", size=4.5, fontface="bold") +
+  theme_minimal() +
+  scale_color_distiller(type="seq", palette="Greens", direction = 1, guide = guide_colorbar(barheight = 10)
+                        , limits = c(0, 1)) +
+  scale_size(range = c(0, 13), guide = "none", limits = c(0, 1)) + 
+    theme(axis.title = element_text(face = "bold", size = 12)
+          , axis.text =  element_text(face="bold", size = 12))
+}
+
+```
+
+
+```{r}
+# table(factor.preds, factor.obs) %>% 
+#   as.matrix() %>% 
+#   apply(MARGIN = 2, function(x) x / sum(x)) %>%
+#   as.data.frame() %>% 
+#   rownames_to_column("Predicted") %>% 
+#   pivot_longer(cols = `0`:`7/8`, names_to = "Observed", values_to = "Proportion") %>% 
+#   mutate(PropLab = ifelse(Proportion>=0.05, round(Proportion, 2), "")
+#          , Predicted = factor(Predicted, levels=c("7/8", 6:0))
+#          ) %>% 
+#   ggplot(aes(x=Observed, y=Predicted, size=Proportion, color=Proportion, label=PropLab)) + 
+#   geom_point(shape=15) +
+#   geom_text(color="black", size=4.5, fontface="bold") +
+#   theme_minimal() +
+#   scale_color_distiller(type="seq", palette="Greens", direction = 1, guide = guide_colorbar(barheight = 10)) +
+#   scale_size(range = c(0, 13), guide = "none")
+
+
+```
+
+# Preface 
+
+- Recall that category/score 7 is truly a 7/8 combined category (in both predicted and observed data)
+- Present the "top two" models (highest accuracy and concordance) and calibration plots. Complete results on all 12 fitted models are included below 
+- Including only models with narrative features (either KG-selected or all observed) 
+- Models use updated codified (8-25-2023) and narrative (10-21-2023) data files
+- PDDS scores used in causal analysis removed from PDDS imputation cohort 
+  - More specifically, any PDDS score observed after DMT initiation in patients with a valid sustained increase/decrease was removed 
+- Additional metrics (Kendall's $\tau$, Somers' D, Cohen's $\kappa$) omitted but can be re-included 
+- We measure concordance by both predicted class (discrete value 0 to 7) and expectation calculated as $\hat{E}(Y_j) = \sum_{j=0}^7 j\hat{P}(Y_j = j) = \sum_{j=1}^8 j\left(\hat{F}(j) -\hat{F}(j-1) \right)$. We also include a concordance measure by linear predictor $logit(\hat{F}(j))$, but note this is equivalent to the concordance by expectation
+
+# (Proposed) Primary Models
+
+```{r}
+results = Map(impute.preds, models, analytic_dfs)
+covar.sum = Map(reg_covar_sum, models)
+
+results.tbl = dplyr::bind_cols(Models = model.rds
+                               , Reduce("rbind", results)
+                               , Reduce("rbind", covar.sum)
+                               ) %>% 
+  mutate(Lookback = paste(coalesce(as.numeric(gsub("\\D", "", Models)), Inf), "months")
+         , Penalty = str_extract(Models, "ridge|lasso")
+         , Covariates = str_extract(Models, "KG_ONCE|EHR_NLP")
+         ) %>% 
+  select(Lookback, Penalty, Covariates
+         , Accuracy, starts_with("Concordance")
+         , `N EHR Fts`:`N Non-zero NLP Fts`) %>%
+  mutate_if(is.numeric, round, 4)
+
+results.tbl %>% 
+  arrange(desc(ConcordanceExpectation)) %>%
+  head(2) %>% 
+  knitr::kable()
+
+# saveRDS(results.tbl, here("Results", "PrimaryPDDSImputationResults.RDS"))
+```
+
+# Calibration Plots 
+
+
+```{r, results=F}
+corplot.titles = paste0(coalesce(as.numeric(gsub("\\D", "", model.rds)), Inf), " months lookback; "
+      , str_extract(model.rds, "ridge|lasso"), " penalty; "
+      , str_extract(model.rds, "KG_ONCE|EHR_NLP"), " covariates"
+      )
+
+grepl.and = function(patterns, string, values=T, case.insensitive=T){
+  init = rep(T, length(string))
+  string.init = string
+  
+  if(case.insensitive){
+    string = tolower(string)
+    patterns = tolower(patterns)
+  }
+  
+  for(p in 1:length(patterns)){
+    init = init & grepl(patterns[p], string)
+  }
+  
+  if(values) return(string.init[init])
+  return(init)
+}
+
+indx = grepl.and(c("Inf", "ridge", "EHR_NLP"), corplot.titles, values=F) | grepl.and(c("12", "ridge", "EHR_NLP"), corplot.titles, values=F)
+
+# Map(.pred_corplot, models, analytic_dfs, corplot.titles)
+Map(.pred_corplot, models[indx], analytic_dfs[indx], corplot.titles[indx])
+```
+
+```{r}
+
+windx = c(which(indx), 9)
+
+
+png(filename = here("Results", "PDDSImputation_Ridge12EHRNLP_CalibrationPlot.png")
+        , width = 480*4, height = 480*3, units = "px", res=300)
+
+.pred_corplot(object = models[[windx[1]]]
+              , data = analytic_dfs[[windx[1]]])
+dev.off()
+
+
+png(filename = here("Results", "PDDSImputation_RidgeAllKG_ONCE_CalibrationPlot.png")
+    , width = 480*4, height = 480*3, units = "px", res=300)
+
+.pred_corplot(object = models[[windx[2]]]
+              , data = analytic_dfs[[windx[2]]])
+dev.off()
+
+
+png(filename = here("Results", "PDDSImputation_RidgeAllEHRNLP_CalibrationPlot.png")
+    , width = 480*4, height = 480*3.5, units = "px", res=300)
+
+.pred_corplot(object = models[[windx[3]]]
+              , data = analytic_dfs[[windx[3]]])
+dev.off()
+
+```
+
+```{r, include=F}
+# saving calibration plots for primary models 
+# windx = c(which(indx), 9)
+# 
+# 
+# png(filename = here("Results", "PDDSImputation_Ridge12EHRNLP_CalibrationPlot.png")
+#         , width = 480*4, height = 480*4, units = "px", res=300)
+# 
+# object = models[[windx[1]]]
+# data = analytic_dfs[[windx[1]]]
+# .title = corplot.titles[windx[1]]
+# 
+# .preds = impute.preds(model = object, .data = data, return.preds = T)-1
+#   
+#   set.seed(826178) #hard-coded seed to assure same text-index as in training 
+# 
+#   cv_ids = sample(unique(data$analytic_df$PATIENT_NUM)
+#                   , size = 0.8*length(unique(data$analytic_df$PATIENT_NUM))
+#                   , replace = F)
+#   
+#   cv_indx = data$analytic_df$PATIENT_NUM %in% cv_ids
+#   test_indx = data$analytic_df$PATIENT_NUM %nin% cv_ids
+# 
+#   factor.preds = factor(.preds, levels=0:7)
+#   levels(factor.preds)[8] = "7/8"
+#   factor.obs = factor(data$Y[test_indx])
+#   levels(factor.obs)[8] = "7/8"
+#   table(factor.preds, factor.obs)
+#   
+# 
+#   # table(.preds-1, analytic_output_KG$Y[test_indx]) %>%
+#   # table(.preds, data$Y[test_indx]) %>%
+#   table(factor.preds, factor.obs) %>% 
+#     as.matrix() %>% 
+#     apply(MARGIN = 2, function(x) x / sum(x)) %>% 
+#     corrplot::corrplot(is.corr = F
+#                        , mar = c(1, 5, 3, 1)
+#                        , title = .title
+#                        , col.lim = c(0, 1)
+#                        , col = COL1("Greens", 100)
+#                        , addCoef.col = 'black'
+#                        , method = 'square'
+#                        , tl.col = 'black'
+#     )
+#   mtext("Predicted Values", side=2, line=0, at=3.4, las=0.2)
+#   mtext("Observed Values", side=1, line=-22, at=5, las=0.2)
+#   
+# dev.off()
+# 
+# 
+# 
+# png(filename = here("Results", "PDDSImputation_RidgeAllKG_ONCE_CalibrationPlot.png")
+#     , width = 480*4, height = 480*4, units = "px", res=300)
+# 
+# object = models[[windx[2]]]
+# data = analytic_dfs[[windx[2]]]
+# .title = corplot.titles[windx[2]]
+# 
+# .preds = impute.preds(model = object, .data = data, return.preds = T)-1
+#   
+#   set.seed(826178) #hard-coded seed to assure same text-index as in training 
+# 
+#   cv_ids = sample(unique(data$analytic_df$PATIENT_NUM)
+#                   , size = 0.8*length(unique(data$analytic_df$PATIENT_NUM))
+#                   , replace = F)
+#   
+#   cv_indx = data$analytic_df$PATIENT_NUM %in% cv_ids
+#   test_indx = data$analytic_df$PATIENT_NUM %nin% cv_ids
+# 
+#   factor.preds = factor(.preds, levels=0:7)
+#   levels(factor.preds)[8] = "7/8"
+#   factor.obs = factor(data$Y[test_indx])
+#   levels(factor.obs)[8] = "7/8"
+#   table(factor.preds, factor.obs)
+# 
+#   # table(.preds-1, analytic_output_KG$Y[test_indx]) %>%
+#   # table(.preds, data$Y[test_indx]) %>%
+#   table(factor.preds, factor.obs) %>% 
+#     as.matrix() %>% 
+#     apply(MARGIN = 2, function(x) x / sum(x)) %>% 
+#     corrplot::corrplot(is.corr = F
+#                        , mar = c(1, 5, 3, 1)
+#                        , title = .title
+#                        , col.lim = c(0, 1)
+#                        , col = COL1("Greens", 100)
+#                        , addCoef.col = 'black'
+#                        , method = 'square'
+#                        , tl.col = 'black'
+#     )
+#   mtext("Predicted Values", side=2, line=0, at=3.4, las=0.2)
+#   mtext("Observed Values", side=1, line=-22, at=5, las=0.2)
+#   
+# dev.off()
+# 
+# 
+# 
+# png(filename = here("Results", "PDDSImputation_RidgeAllEHRNLP_CalibrationPlot.png")
+#     , width = 480*4, height = 480*4, units = "px", res=300)
+# object = models[[windx[3]]]
+# data = analytic_dfs[[windx[3]]]
+# .title = corplot.titles[windx[3]]
+# 
+# .preds = impute.preds(model = object, .data = data, return.preds = T)-1
+#   
+#   set.seed(826178) #hard-coded seed to assure same text-index as in training 
+# 
+#   cv_ids = sample(unique(data$analytic_df$PATIENT_NUM)
+#                   , size = 0.8*length(unique(data$analytic_df$PATIENT_NUM))
+#                   , replace = F)
+#   
+#   cv_indx = data$analytic_df$PATIENT_NUM %in% cv_ids
+#   test_indx = data$analytic_df$PATIENT_NUM %nin% cv_ids
+# 
+#   
+#   # table(.preds-1, analytic_output_KG$Y[test_indx]) %>%
+#   table(.preds, data$Y[test_indx]) %>%
+#     as.matrix() %>% 
+#     apply(MARGIN = 2, function(x) x / sum(x)) %>% 
+#     corrplot::corrplot(is.corr = F
+#                        , mar = c(1, 5, 3, 1)
+#                        , title = .title
+#                        , col.lim = c(0, 1)
+#                        , col = COL1("Greens", 100)
+#                        , addCoef.col = 'black'
+#                        , method = 'square'
+#                        , tl.col = 'black'
+#     )
+#   mtext("Predicted Values", side=2, line=0, at=3.4, las=0.2)
+#   mtext("Observed Values", side=1, line=-22, at=5, las=0.2)
+#   
+# dev.off()
+
+
+```
+
+# Feature Cleaning Summary 
+
+## EHR 
+
+```{r}
+ft.length = function(x) unlist(lapply(x$.ehr_ft_summary, length))
+
+ehr.fts.tbl = dplyr::bind_cols(Models = model.rds
+                               , Reduce("rbind", Map(ft.length, analytic_dfs))
+                               ) %>% 
+  mutate(Lookback = paste(coalesce(as.numeric(gsub("\\D", "", Models)), Inf), "months")
+         , Penalty = str_extract(Models, "ridge|lasso")
+         , Covariates = str_extract(Models, "KG_ONCE|EHR_NLP")
+         ) %>% 
+  select(Lookback, Penalty, Covariates
+         , everything()) %>% 
+  select(-Models)
+
+ehr.fts.tbl %>% arrange(desc(Covariates)) %>% knitr::kable()
+```
+
+## NLP 
+
+```{r}
+ft.length = function(x) unlist(lapply(x$.nlp_ft_summary, length))
+
+nlp.fts.tbl = dplyr::bind_cols(Models = model.rds
+                               , Reduce("rbind", Map(ft.length, analytic_dfs))
+                               ) %>% 
+  mutate(Lookback = paste(coalesce(as.numeric(gsub("\\D", "", Models)), Inf), "months")
+         , Penalty = str_extract(Models, "ridge|lasso")
+         , Covariates = str_extract(Models, "KG_ONCE|EHR_NLP")
+         ) %>% 
+  select(Lookback, Penalty, Covariates
+         , everything()) %>% 
+  select(-Models)
+
+nlp.fts.tbl %>% arrange(desc(Covariates)) %>% knitr::kable()
+```
+
+
+# Full Results (Tabular) 
+
+```{r}
+# impute.preds(models[[1]], .data = analytic_dfs[[1]])
+# results = Map(impute.preds, models, analytic_dfs)
+# covar.sum = Map(reg_covar_sum, models)
+# 
+# results.tbl = dplyr::bind_cols(Models = model.rds
+#                                , Reduce("rbind", results)
+#                                , Reduce("rbind", covar.sum)
+#                                ) %>% 
+#   mutate(Lookback = paste(coalesce(as.numeric(gsub("\\D", "", Models)), Inf), "months")
+#          , Penalty = str_extract(Models, "ridge|lasso")
+#          , Covariates = str_extract(Models, "KG_ONCE|EHR_NLP")
+#          ) %>% 
+#   select(Lookback, Penalty, Covariates
+#          , Accuracy, Concordance
+#          , `N EHR Fts`:`N Non-zero NLP Fts`) %>%
+#   mutate_if(is.numeric, round, 4)
+
+results.tbl %>% knitr::kable()
+```
+
+
+
+# Full Calibration Plots
+
+In addition to our performance metrics, we (heuristically) evaluate the calibration of our models by comparing predicted and observed values of PDDS in our hold-out/test patients. A perfect model would be a solid diagonal with 0 values in any off-diagonal square. 
+
+
+*Numbers represent columnwise proportions, e.g. among a given observed PDDS the proportion which were predicted for any value*: 
+
+
+```{r, results=F}
+# 
+# .pred_corplot(object = models[[1]]
+#               , data = analytic_dfs[[1]]
+#               , .title = corplot.titles[[1]])
+
+Map(.pred_corplot, models, analytic_dfs, corplot.titles)
+```
+
+
+<!-- # Statistical/Analytic Notes -->
+
+<!-- \textbf{\it Including same statistical summary included in notes of previous results reviews} -->
+
+<!-- Calibration is assessed visually by the presented plots of predicted vs. observed PDDS scores. These plots are presented for high-perming models, wiht additional plots available in the appendix at the end of the page. -->
+
+<!-- Codified features included RXNORM, PheCodes, CCS-PCS, and LOINC codes. Local lab values were removed. -->
+
+<!-- Narrative features describe NLP-generated features at the CUI level. -->
+
+<!-- Misclassification rate was used in $\lambda$ selection for penalized rates via 10-fold CV in a validation set (80% of total data, \~10,000 observations). Models were fit on the total validation set and predicted values caluclated for the remaining hold-out set and performance measures calculated (see below for details). -->
+
+<!-- Validation and hold-out set contained distinct sets of patients. -->
+
+<!-- ### Performance Measures -->
+
+
+<!-- #### Kendall's $\tau$ (also Kendall's Rank Correlation Coefficient) -->
+
+<!-- A symmetric measure of concordance for ordinal prediction. Ranges from -1 to 1, with values near 0 indicated (near-)random assignment of categories, while 1 represents perfect concordance of predictions with observed outcomes.  -->
+
+<!-- $$ -->
+<!-- \tau_b = \frac{{n_c - n_d}}{\sqrt{(N-n_1)(N-n_2)}} \approx \frac{{n_c - n_d}}{n_c+n_d} -->
+<!-- $$ -->
+
+<!-- where:\ -->
+<!-- - $n_c$ is the number of concordant pairs, i.e., pairs of observations that have the same order in both variables\ -->
+<!-- - $n_d$ is the number of discordant pairs, i.e., pairs of observations that have different orders in the two variables -->
+<!-- - The denominator is essentially a total $n_c+n_d = {n\choose2}$ comparisons, corrected for present of ties. If no ties are present, we recover ${n\choose2}=n_c+n_d$ as the denominator -->
+
+<!-- #### Cohen's Weighted Kappa -->
+
+<!-- Cohen's Weighted Kappa is a statistic used to measure the degree of agreement between two raters who are evaluating the same set of items. It is an extension of Cohen's Kappa, which is used for binary classification. Weighted Kappa takes into account the degree of disagreement between ratings, assigning higher weights to larger disagreements -->
+
+<!-- Cohen's Weighted Kappa: -->
+
+<!-- $$ -->
+<!-- \kappa_w = 1 - \frac{\sum_{i,j} w_{ij}O_{ij}}{\sum_{i,j} w_{ij}E_{ij}} -->
+<!-- $$ -->
+
+<!-- where:\ -->
+<!-- - $O_{ij}$ is the observed agreement for the category $i$ and $j$\ -->
+<!-- - $E_{ij}$ is the expected agreement for the category $i$ and $j$ (which is calculated from the marginal probabilities of the raters' categories).\ -->
+<!-- - $w_{ij}$ is quadratic weight associated with the disagreement between categories $i$ and $j$ (i.e. $(i-j)^2$. -->
+
+<!-- #### Somers' D -->
+
+<!-- Somers' quantifies strength and direction of association between two ordinal variables. It is particularly useful when dealing with ranked or ordered data and is calculated by comparing the concordance of predictions across prediction-observation pairs. Somers' D ranges from -1 to 1, with higher values corresponding to better association between predicted and observed ordinal categories. It is an asymmetric extension of Kendall's $\tau$ as defined above.  -->
+
+<!-- $$ -->
+<!-- D = \frac{2(n_c - n_d)}{N^2 - \sum{N_{i\cdot}^2}} -->
+<!-- $$ -->
+
+
+
+
