@@ -3,6 +3,7 @@
 This repository contains code, relevant files, and some additional supplementary results for the work
 **Comparison of B-cell depletion versus natalizumab for treatment of multiple sclerosis: A semi-supervised causal analysis** from Dominic DiSanto, Weijing Tang PhD, Wen Zhu MD, Michele Morris BS, Shyam Visweswaran, MD, Tianxi Cai, ScD, Zongqi Xia, MD. 
 
+A pre-print of this work is available at https://www.medrxiv.org/content/10.1101/2025.01.24.25321100v1. A compilation of the Tables and Figures of this work is included within this repository. 
 
 Code contained under `Code/.` (not in sub-folders) is related to the construction of the BCD and NTZ analytic cohorts. Numbered files are interim programs called through the cohort construction. `00_shared_setup.R` is commonly called as a preamble to analytic files for loading of packages, setting of data-file paths. 
 
